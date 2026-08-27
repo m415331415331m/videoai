@@ -13,7 +13,6 @@ app.use(cors());
 app.use(express.json());
 app.use('/media', express.static('media'));
 
-// Health check endpoint
 app.get('/', (req, res) => {
   res.json({ success: true, service: "video-worker", status: "online" });
 });
@@ -28,7 +27,7 @@ app.post('/analyze', async (req, res) => {
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ success: false, error: "GEMINI_API_KEY is missing in environment variables" });
+    return res.status(500).json({ success: false, error: "GEMINI_API_KEY is not set in Railway variables" });
   }
 
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -41,12 +40,10 @@ app.post('/analyze', async (req, res) => {
   const rawVideoPath = path.join(workDir, `raw_${timestamp}.mp4`);
 
   try {
-    // 1. Download Video using yt-dlp (lightweight resolution to preserve RAM)
     await execPromise(`yt-dlp -f "best[height<=720]" -o "${rawVideoPath}" "${targetUrl}"`);
 
-    // 2. Prompt analysis
     const prompt = `أنت خبير في مقاطع الفيديو القصيرة (Shorts/Reels). قم بتحليل هذا الفيديو واستخرج أفضل المقاطع المفتاحية.
-أرجع الناتج بتنسيق JSON فقط على الشكل التالي:
+أرجع الناتج بتنسيق JSON فقط على الشكل التالي دون أي نصوص إضافية:
 {
   "clips": [
     {
@@ -63,14 +60,11 @@ app.post('/analyze', async (req, res) => {
 
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
-    
-    // Clean markdown syntax if present
     const cleanJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
     const analysisResult = JSON.parse(cleanJson);
 
     const host = `${req.protocol}://${req.get('host')}`;
 
-    // 3. Clip processing using FFmpeg
     const processedClips = [];
     for (let i = 0; i < analysisResult.clips.length; i++) {
       const clip = analysisResult.clips[i];
@@ -105,3 +99,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+  
