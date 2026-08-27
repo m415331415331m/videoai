@@ -13,7 +13,6 @@ app.use(cors());
 app.use(express.json());
 app.use('/media', express.static('media'));
 
-// Health Check Endpoint
 app.get('/', (req, res) => {
   res.json({ success: true, service: "video-worker", status: "online" });
 });
@@ -41,13 +40,9 @@ app.post('/analyze', async (req, res) => {
   const audioPath = path.join(workDir, `audio_${timestamp}.mp3`);
 
   try {
-    // 1. Download video
     await execPromise(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${rawVideoPath}" "${targetUrl}"`);
-
-    // 2. Extract audio
     await execPromise(`ffmpeg -i "${rawVideoPath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}"`);
 
-    // 3. Upload & Analyze with Gemini SDK
     const audioFile = await ai.files.upload({
       file: audioPath,
       mimeType: 'audio/mp3',
@@ -78,7 +73,6 @@ app.post('/analyze', async (req, res) => {
     const analysisResult = JSON.parse(response.text);
     const host = `${req.protocol}://${req.get('host')}`;
 
-    // 4. Clip video sections
     const processedClips = [];
     for (let i = 0; i < analysisResult.clips.length; i++) {
       const clip = analysisResult.clips[i];
