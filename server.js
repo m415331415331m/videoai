@@ -4,7 +4,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const execPromise = promisify(exec);
 const app = express();
@@ -13,6 +13,7 @@ app.use(cors());
 app.use(express.json());
 app.use('/media', express.static('media'));
 
+// Health check endpoint
 app.get('/', (req, res) => {
   res.json({ success: true, service: "video-worker", status: "online" });
 });
@@ -27,29 +28,25 @@ app.post('/analyze', async (req, res) => {
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ success: false, error: "GEMINI_API_KEY is not set in Railway variables" });
+    return res.status(500).json({ success: false, error: "GEMINI_API_KEY is missing in environment variables" });
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
   const workDir = path.join(process.cwd(), 'media');
   if (!fs.existsSync(workDir)) fs.mkdirSync(workDir, { recursive: true });
 
   const timestamp = Date.now();
   const rawVideoPath = path.join(workDir, `raw_${timestamp}.mp4`);
-  const audioPath = path.join(workDir, `audio_${timestamp}.mp3`);
 
   try {
-    await execPromise(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${rawVideoPath}" "${targetUrl}"`);
-    await execPromise(`ffmpeg -i "${rawVideoPath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}"`);
+    // 1. Download Video using yt-dlp (lightweight resolution to preserve RAM)
+    await execPromise(`yt-dlp -f "best[height<=720]" -o "${rawVideoPath}" "${targetUrl}"`);
 
-    const audioFile = await ai.files.upload({
-      file: audioPath,
-      mimeType: 'audio/mp3',
-    });
-
-    const prompt = `أنت خبير في مقاطع الفيديو القصيرة (Shorts/Reels). قم بتحليل هذا المقطع الصوتي واستخرج أفضل المقاطع المفتاحية ذات الجاذبية العالية. 
-أرجع الناتج بتنسيق JSON فقط على الشكل التالي دون أي نصوص إضافية:
+    // 2. Prompt analysis
+    const prompt = `أنت خبير في مقاطع الفيديو القصيرة (Shorts/Reels). قم بتحليل هذا الفيديو واستخرج أفضل المقاطع المفتاحية.
+أرجع الناتج بتنسيق JSON فقط على الشكل التالي:
 {
   "clips": [
     {
@@ -64,15 +61,16 @@ app.post('/analyze', async (req, res) => {
   ]
 }`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [audioFile, prompt],
-      config: { responseMimeType: 'application/json' }
-    });
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+    
+    // Clean markdown syntax if present
+    const cleanJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+    const analysisResult = JSON.parse(cleanJson);
 
-    const analysisResult = JSON.parse(response.text);
     const host = `${req.protocol}://${req.get('host')}`;
 
+    // 3. Clip processing using FFmpeg
     const processedClips = [];
     for (let i = 0; i < analysisResult.clips.length; i++) {
       const clip = analysisResult.clips[i];
@@ -105,5 +103,5 @@ app.post('/analyze', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
