@@ -4,7 +4,6 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
-// الإصلاح الجذري: Named Import لمكتبة Gemini
 import { GoogleGenAI } from '@google/genai';
 
 const execPromise = promisify(exec);
@@ -14,7 +13,7 @@ app.use(cors());
 app.use(express.json());
 app.use('/media', express.static('media'));
 
-// فحص صحة الخادم (Health Check)
+// Health Check Endpoint
 app.get('/', (req, res) => {
   res.json({ success: true, service: "video-worker", status: "online" });
 });
@@ -29,7 +28,7 @@ app.post('/analyze', async (req, res) => {
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ success: false, error: "GEMINI_API_KEY is missing in Railway variables" });
+    return res.status(500).json({ success: false, error: "GEMINI_API_KEY is not set in Railway variables" });
   }
 
   const ai = new GoogleGenAI({ apiKey });
@@ -42,13 +41,13 @@ app.post('/analyze', async (req, res) => {
   const audioPath = path.join(workDir, `audio_${timestamp}.mp3`);
 
   try {
-    // 1. تنزيل الفيديو
+    // 1. Download video
     await execPromise(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${rawVideoPath}" "${targetUrl}"`);
 
-    // 2. استخراج الصوت
+    // 2. Extract audio
     await execPromise(`ffmpeg -i "${rawVideoPath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}"`);
 
-    // 3. رفع الصوت والتحليل عبر Gemini
+    // 3. Upload & Analyze with Gemini SDK
     const audioFile = await ai.files.upload({
       file: audioPath,
       mimeType: 'audio/mp3',
@@ -79,7 +78,7 @@ app.post('/analyze', async (req, res) => {
     const analysisResult = JSON.parse(response.text);
     const host = `${req.protocol}://${req.get('host')}`;
 
-    // 4. قص المقاطع ومعالجتها
+    // 4. Clip video sections
     const processedClips = [];
     for (let i = 0; i < analysisResult.clips.length; i++) {
       const clip = analysisResult.clips[i];
@@ -110,7 +109,6 @@ app.post('/analyze', async (req, res) => {
   }
 });
 
-// التشغيل المتوافق مع Railway
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is running on port ${PORT}`);
