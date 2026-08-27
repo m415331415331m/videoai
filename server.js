@@ -4,20 +4,16 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
-import { GoogleGenAI } from '@google/genai';
+import GoogleGenAI from '@google/genai';
 
 const execPromise = promisify(exec);
 const app = express();
 
 app.use(cors());
 app.use(express.json());
-// إتاحة الملفات الناتجة للاستعراض والتنزيل
 app.use('/media', express.static('media'));
 
-// تهيئة Gemini API باستخدام المفتاح من متغيرات البيئة
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-// فحص صحة الخادم (Health Check Endpoint)
+// فحص صحة الخادم عند فتح الرابط المباشر
 app.get('/', (req, res) => {
   res.json({ success: true, service: "video-worker", status: "online" });
 });
@@ -30,6 +26,13 @@ app.post('/analyze', async (req, res) => {
     return res.status(400).json({ success: false, error: "Missing video URL" });
   }
 
+  // تهيئة Gemini بداخل الـ Handler لتفادي الكراش في حال غياب المفتاح عند الإقلاع
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ success: false, error: "GEMINI_API_KEY is not set in Railway variables" });
+  }
+  const ai = new GoogleGenAI({ apiKey });
+
   const workDir = path.join(process.cwd(), 'media');
   if (!fs.existsSync(workDir)) fs.mkdirSync(workDir, { recursive: true });
 
@@ -38,13 +41,13 @@ app.post('/analyze', async (req, res) => {
   const audioPath = path.join(workDir, `audio_${timestamp}.mp3`);
 
   try {
-    // 1. تنزيل الفيديو باستخدام yt-dlp
+    // 1. تنزيل الفيديو
     await execPromise(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${rawVideoPath}" "${targetUrl}"`);
 
-    // 2. استخراج الصوت باستخدام FFmpeg
+    // 2. استخراج الصوت
     await execPromise(`ffmpeg -i "${rawVideoPath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}"`);
 
-    // 3. رفع الصوت وإرساله لـ Gemini للتحليل واستخراج المقاطع
+    // 3. رفع الصوت للتحليل عبر Gemini
     const audioFile = await ai.files.upload({
       file: audioPath,
       mimeType: 'audio/mp3',
@@ -75,7 +78,7 @@ app.post('/analyze', async (req, res) => {
     const analysisResult = JSON.parse(response.text);
     const host = `${req.protocol}://${req.get('host')}`;
 
-    // 4. قص المقاطع ومعالجتها عبر FFmpeg
+    // 4. قص المقاطع
     const processedClips = [];
     for (let i = 0; i < analysisResult.clips.length; i++) {
       const clip = analysisResult.clips[i];
@@ -83,7 +86,6 @@ app.post('/analyze', async (req, res) => {
       const clipPath = path.join(workDir, `${clipId}.mp4`);
       const duration = clip.end - clip.start;
 
-      // قص المقطع
       await execPromise(`ffmpeg -ss ${clip.start} -i "${rawVideoPath}" -t ${duration} -c:v libx264 -c:a aac "${clipPath}"`);
 
       processedClips.push({
@@ -107,8 +109,9 @@ app.post('/analyze', async (req, res) => {
   }
 });
 
-// الاستماع على المضيف 0.0.0.0 لمنع خطأ 502 في Railway
+// تحديد المنفذ والمضيف بشكل متوافق مع Railway
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Video Processing Worker running on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
+    
