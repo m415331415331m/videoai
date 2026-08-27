@@ -5,10 +5,6 @@ import { promisify } from "util";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import {
-  GoogleGenerativeAI,
-  GoogleAIFileManager
-} from "@google/generative-ai";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -22,10 +18,7 @@ const app = express();
 
 const PORT = Number(process.env.PORT) || 8080;
 
-const MEDIA_DIR = path.join(
-  __dirname,
-  "media"
-);
+const MEDIA_DIR = path.join(__dirname, "media");
 
 fs.mkdirSync(MEDIA_DIR, {
   recursive: true
@@ -81,7 +74,7 @@ app.get("/health", (req, res) => {
    HELPERS
 ===================================================== */
 
-function validUrl(value) {
+function isValidUrl(value) {
   try {
     const parsed = new URL(value);
 
@@ -94,39 +87,27 @@ function validUrl(value) {
   }
 }
 
-function cleanGeminiJson(text) {
+function cleanJson(text) {
   let value = String(text || "")
-    .trim()
     .replace(/```json/gi, "")
     .replace(/```/g, "")
     .trim();
 
-  const firstBrace = value.indexOf("{");
-  const lastBrace = value.lastIndexOf("}");
+  const first = value.indexOf("{");
+  const last = value.lastIndexOf("}");
 
-  if (
-    firstBrace === -1 ||
-    lastBrace === -1
-  ) {
+  if (first === -1 || last === -1) {
     throw new Error(
-      "Gemini did not return JSON."
+      "Gemini did not return valid JSON."
     );
   }
 
-  value = value.substring(
-    firstBrace,
-    lastBrace + 1
+  value = value.slice(
+    first,
+    last + 1
   );
 
   return JSON.parse(value);
-}
-
-function safeNumber(value, fallback) {
-  const n = Number(value);
-
-  return Number.isFinite(n)
-    ? n
-    : fallback;
 }
 
 function removeFile(filePath) {
@@ -145,204 +126,238 @@ function removeFile(filePath) {
   }
 }
 
+function safeNumber(value, fallback) {
+  const number = Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
+}
+
 /* =====================================================
-   ANALYZE
+   GEMINI FILE UPLOAD
 ===================================================== */
 
-app.post("/analyze", async (req, res) => {
-  const requestId =
-    `${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 8)}`;
+async function uploadToGemini(
+  filePath,
+  apiKey,
+  displayName
+) {
+  const fileStats =
+    fs.statSync(filePath);
 
-  let rawVideoPath = null;
-  let uploadedGeminiFile = null;
-
-  try {
-    console.log(
-      `[${requestId}] Analyze request received`
-    );
-
-    const {
-      url,
-      videoUrl,
-      youtubeUrl
-    } = req.body || {};
-
-    const targetUrl =
-      url ||
-      videoUrl ||
-      youtubeUrl;
-
-    /* ---------------------------------------------
-       Validate URL
-    --------------------------------------------- */
-
-    if (!targetUrl) {
-      return res.status(400).json({
-        success: false,
-        requestId,
-        error: "Missing video URL."
-      });
+  const metadata = {
+    file: {
+      display_name: displayName
     }
+  };
 
-    if (!validUrl(targetUrl)) {
-      return res.status(400).json({
-        success: false,
-        requestId,
-        error: "Invalid video URL."
-      });
-    }
+  /*
+   * Gemini Files API upload.
+   *
+   * Upload is performed as resumable media.
+   */
 
-    /* ---------------------------------------------
-       Gemini API key
-    --------------------------------------------- */
-
-    const apiKey =
-      process.env.GEMINI_API_KEY;
-
-    if (!apiKey) {
-      console.error(
-        `[${requestId}] GEMINI_API_KEY missing`
-      );
-
-      return res.status(500).json({
-        success: false,
-        requestId,
-        error:
-          "GEMINI_API_KEY is missing in Railway Variables."
-      });
-    }
-
-    const timestamp = Date.now();
-
-    rawVideoPath = path.join(
-      MEDIA_DIR,
-      `raw_${timestamp}.mp4`
-    );
-
-    /* ---------------------------------------------
-       Download video
-    --------------------------------------------- */
-
-    console.log(
-      `[${requestId}] Downloading video`
-    );
-
-    await execFileAsync(
-      "yt-dlp",
-      [
-        "--no-playlist",
-        "--no-warnings",
-        "--restrict-filenames",
-        "-f",
-        "best[height<=720]/best",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        rawVideoPath,
-        targetUrl
-      ],
+  const startResponse =
+    await fetch(
+      `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`,
       {
-        maxBuffer:
-          30 * 1024 * 1024
+        method: "POST",
+        headers: {
+          "X-Goog-Upload-Protocol":
+            "resumable",
+
+          "X-Goog-Upload-Command":
+            "start",
+
+          "X-Goog-Upload-Header-Content-Length":
+            String(fileStats.size),
+
+          "X-Goog-Upload-Header-Content-Type":
+            "video/mp4",
+
+          "Content-Type":
+            "application/json"
+        },
+
+        body: JSON.stringify(
+          metadata
+        )
       }
     );
 
+  if (!startResponse.ok) {
+    const errorText =
+      await startResponse.text();
+
+    throw new Error(
+      `Gemini upload initialization failed (${startResponse.status}): ${errorText}`
+    );
+  }
+
+  const uploadUrl =
+    startResponse.headers.get(
+      "x-goog-upload-url"
+    );
+
+  if (!uploadUrl) {
+    throw new Error(
+      "Gemini did not return an upload URL."
+    );
+  }
+
+  const fileBuffer =
+    fs.readFileSync(filePath);
+
+  const uploadResponse =
+    await fetch(uploadUrl, {
+      method: "POST",
+
+      headers: {
+        "Content-Length":
+          String(fileBuffer.length),
+
+        "X-Goog-Upload-Offset":
+          "0",
+
+        "X-Goog-Upload-Command":
+          "upload, finalize",
+
+        "Content-Type":
+          "video/mp4"
+      },
+
+      body: fileBuffer
+    });
+
+  if (!uploadResponse.ok) {
+    const errorText =
+      await uploadResponse.text();
+
+    throw new Error(
+      `Gemini video upload failed (${uploadResponse.status}): ${errorText}`
+    );
+  }
+
+  const uploadJson =
+    await uploadResponse.json();
+
+  const uploadedFile =
+    uploadJson.file;
+
+  if (
+    !uploadedFile ||
+    !uploadedFile.uri
+  ) {
+    throw new Error(
+      "Gemini upload succeeded but no file URI was returned."
+    );
+  }
+
+  return uploadedFile;
+}
+
+/* =====================================================
+   WAIT FOR GEMINI FILE
+===================================================== */
+
+async function waitForGeminiFile(
+  fileName,
+  apiKey
+) {
+  const maxAttempts = 30;
+
+  for (
+    let attempt = 0;
+    attempt < maxAttempts;
+    attempt++
+  ) {
+    const response =
+      await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${encodeURIComponent(apiKey)}`
+      );
+
+    if (!response.ok) {
+      const text =
+        await response.text();
+
+      throw new Error(
+        `Gemini file status failed (${response.status}): ${text}`
+      );
+    }
+
+    const data =
+      await response.json();
+
+    const state =
+      data?.state;
+
+    console.log(
+      `Gemini file state: ${state || "UNKNOWN"}`
+    );
+
+    if (state === "ACTIVE") {
+      return data;
+    }
+
     if (
-      !fs.existsSync(rawVideoPath)
+      state === "FAILED" ||
+      state === "ERROR"
     ) {
       throw new Error(
-        "yt-dlp completed but video file was not created."
+        "Gemini rejected the uploaded video."
       );
     }
 
-    const stats =
-      fs.statSync(rawVideoPath);
-
-    console.log(
-      `[${requestId}] Download complete: ${stats.size} bytes`
+    await new Promise(
+      resolve =>
+        setTimeout(
+          resolve,
+          2000
+        )
     );
+  }
 
-    if (stats.size < 1000) {
-      throw new Error(
-        "Downloaded video is empty or invalid."
-      );
-    }
+  throw new Error(
+    "Timed out waiting for Gemini to process the video."
+  );
+}
 
-    /* ---------------------------------------------
-       Gemini
-    --------------------------------------------- */
+/* =====================================================
+   GEMINI ANALYSIS
+===================================================== */
 
-    console.log(
-      `[${requestId}] Initializing Gemini`
-    );
+async function analyzeVideo(
+  file,
+  apiKey
+) {
+  const model =
+    process.env.GEMINI_MODEL ||
+    "gemini-1.5-flash";
 
-    const genAI =
-      new GoogleGenerativeAI(apiKey);
+  const prompt = `
+Analyze the uploaded video as an expert short-form
+video editor.
 
-    const fileManager =
-      new GoogleAIFileManager(apiKey);
+Identify the strongest moments suitable for:
 
-    const modelName =
-      process.env.GEMINI_MODEL ||
-      "gemini-1.5-flash";
-
-    const model =
-      genAI.getGenerativeModel({
-        model: modelName
-      });
-
-    /* ---------------------------------------------
-       Upload video to Gemini
-    --------------------------------------------- */
-
-    console.log(
-      `[${requestId}] Uploading video to Gemini`
-    );
-
-    const upload =
-      await fileManager.uploadFile(
-        rawVideoPath,
-        {
-          mimeType: "video/mp4",
-          displayName:
-            `video-${timestamp}.mp4`
-        }
-      );
-
-    uploadedGeminiFile =
-      upload.file;
-
-    console.log(
-      `[${requestId}] Gemini file uploaded:`,
-      uploadedGeminiFile.uri
-    );
-
-    /* ---------------------------------------------
-       Analyze actual video
-    --------------------------------------------- */
-
-    const prompt = `
-You are an expert short-form video editor.
-
-Analyze the uploaded video itself.
-
-Find the strongest moments that could become
-YouTube Shorts, Instagram Reels, or TikTok clips.
+- YouTube Shorts
+- Instagram Reels
+- TikTok
 
 Look for:
+
 - strong hooks
-- interesting statements
-- surprising moments
+- surprising statements
 - emotional moments
 - useful information
+- controversial or interesting moments
 - high retention potential
-- clear standalone sections
+- sections that work independently
 
 Return ONLY valid JSON.
 
-Use exactly:
+Required format:
 
 {
   "clips": [
@@ -363,134 +378,186 @@ Use exactly:
 }
 
 Rules:
+
 - start must be a number.
 - end must be a number.
 - end must be greater than start.
-- clips must contain at least one item.
 - Prefer clips between 10 and 60 seconds.
-- Do not invent timestamps outside the video.
+- Do not invent timestamps.
 - Return JSON only.
 - No markdown.
 - No explanation.
 `;
 
-    console.log(
-      `[${requestId}] Asking Gemini to analyze video`
-    );
+  const response =
+    await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
 
-    const result =
-      await model.generateContent([
-        {
-          fileData: {
-            mimeType:
-              uploadedGeminiFile.mimeType ||
-              "video/mp4",
-            fileUri:
-              uploadedGeminiFile.uri
-          }
+        headers: {
+          "Content-Type":
+            "application/json"
         },
-        prompt
-      ]);
 
-    const text =
-      result.response.text();
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  file_data: {
+                    mime_type:
+                      file.mimeType ||
+                      "video/mp4",
 
-    console.log(
-      `[${requestId}] Gemini response received`
+                    file_uri:
+                      file.uri
+                  }
+                },
+
+                {
+                  text: prompt
+                }
+              ]
+            }
+          ],
+
+          generationConfig: {
+            temperature: 0.2,
+            responseMimeType:
+              "application/json"
+          }
+        })
+      }
     );
 
-    const analysis =
-      cleanGeminiJson(text);
+  if (!response.ok) {
+    const errorText =
+      await response.text();
 
-    if (
-      !analysis ||
-      !Array.isArray(
-        analysis.clips
-      ) ||
-      analysis.clips.length === 0
-    ) {
-      throw new Error(
-        "Gemini returned no valid clips."
+    throw new Error(
+      `Gemini analysis failed (${response.status}): ${errorText}`
+    );
+  }
+
+  const data =
+    await response.json();
+
+  const text =
+    data?.candidates?.[0]?.content?.parts
+      ?.map(part => part.text || "")
+      .join("")
+      .trim();
+
+  if (!text) {
+    throw new Error(
+      "Gemini returned an empty response."
+    );
+  }
+
+  return cleanJson(text);
+}
+
+/* =====================================================
+   ANALYZE ENDPOINT
+===================================================== */
+
+app.post(
+  "/analyze",
+  async (req, res) => {
+    const requestId =
+      `${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+
+    let rawVideoPath = null;
+
+    try {
+      console.log(
+        `[${requestId}] Analyze started`
       );
-    }
 
-    /* ---------------------------------------------
-       Generate clips
-    --------------------------------------------- */
+      const {
+        url,
+        videoUrl,
+        youtubeUrl
+      } = req.body || {};
 
-    const host =
-      process.env.PUBLIC_BASE_URL ||
-      `${req.protocol}://${req.get("host")}`;
+      const targetUrl =
+        url ||
+        videoUrl ||
+        youtubeUrl;
 
-    const clips = [];
+      if (!targetUrl) {
+        return res.status(400).json({
+          success: false,
+          requestId,
+          error:
+            "Missing video URL."
+        });
+      }
 
-    for (
-      let i = 0;
-      i < analysis.clips.length;
-      i++
-    ) {
-      const item =
-        analysis.clips[i];
+      if (
+        !isValidUrl(
+          targetUrl
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          requestId,
+          error:
+            "Invalid video URL."
+        });
+      }
 
-      let start =
-        safeNumber(
-          item.start,
-          0
-        );
+      const apiKey =
+        process.env.GEMINI_API_KEY;
 
-      let end =
-        safeNumber(
-          item.end,
-          start + 15
-        );
+      if (!apiKey) {
+        return res.status(500).json({
+          success: false,
+          requestId,
+          error:
+            "GEMINI_API_KEY is missing in Railway Variables.",
+          stage: "configuration"
+        });
+      }
 
-      start =
-        Math.max(
-          0,
-          start
-        );
+      const timestamp =
+        Date.now();
 
-      end =
-        Math.max(
-          start + 1,
-          end
-        );
-
-      const duration =
-        end - start;
-
-      const clipId =
-        `clip_${timestamp}_${i + 1}`;
-
-      const clipPath =
+      rawVideoPath =
         path.join(
           MEDIA_DIR,
-          `${clipId}.mp4`
+          `raw_${timestamp}.mp4`
         );
 
+      /* ---------------------------------------------
+         DOWNLOAD
+      --------------------------------------------- */
+
       console.log(
-        `[${requestId}] Rendering clip ${i + 1}: ${start}-${end}`
+        `[${requestId}] Downloading video`
       );
 
       await execFileAsync(
-        "ffmpeg",
+        "yt-dlp",
         [
-          "-y",
-          "-ss",
-          String(start),
-          "-i",
+          "--no-playlist",
+          "--no-warnings",
+          "--restrict-filenames",
+
+          "-f",
+          "best[height<=720]/best",
+
+          "--merge-output-format",
+          "mp4",
+
+          "-o",
           rawVideoPath,
-          "-t",
-          String(duration),
-          "-c:v",
-          "libx264",
-          "-preset",
-          "veryfast",
-          "-c:a",
-          "aac",
-          "-movflags",
-          "+faststart",
-          clipPath
+
+          targetUrl
         ],
         {
           maxBuffer:
@@ -499,155 +566,267 @@ Rules:
       );
 
       if (
-        !fs.existsSync(clipPath)
+        !fs.existsSync(
+          rawVideoPath
+        )
       ) {
-        console.error(
-          `[${requestId}] Clip file missing`
+        throw new Error(
+          "Video download failed: file was not created."
         );
-
-        continue;
       }
 
-      clips.push({
-        id:
-          item.id ||
-          `clip-${i + 1}`,
+      const stats =
+        fs.statSync(
+          rawVideoPath
+        );
 
-        start,
-        end,
+      console.log(
+        `[${requestId}] Video size: ${stats.size}`
+      );
 
-        title:
-          item.title || "",
+      if (stats.size < 1000) {
+        throw new Error(
+          "Downloaded video is empty."
+        );
+      }
 
-        hook:
-          item.hook || "",
+      /* ---------------------------------------------
+         UPLOAD
+      --------------------------------------------- */
 
-        caption:
-          item.caption || "",
+      console.log(
+        `[${requestId}] Uploading video to Gemini`
+      );
 
-        scores:
-          item.scores || {},
+      const uploaded =
+        await uploadToGemini(
+          rawVideoPath,
+          apiKey,
+          `video-${timestamp}.mp4`
+        );
 
-        previewUrl:
-          `${host}/media/${clipId}.mp4`,
+      console.log(
+        `[${requestId}] Uploaded:`,
+        uploaded.name
+      );
 
-        rawUrl:
-          `${host}/media/raw_${timestamp}.mp4`
+      /* ---------------------------------------------
+         WAIT
+      --------------------------------------------- */
+
+      const activeFile =
+        await waitForGeminiFile(
+          uploaded.name,
+          apiKey
+        );
+
+      /* ---------------------------------------------
+         ANALYZE
+      --------------------------------------------- */
+
+      console.log(
+        `[${requestId}] Analyzing video`
+      );
+
+      const analysis =
+        await analyzeVideo(
+          activeFile,
+          apiKey
+        );
+
+      if (
+        !analysis ||
+        !Array.isArray(
+          analysis.clips
+        ) ||
+        analysis.clips.length === 0
+      ) {
+        throw new Error(
+          "Gemini returned no valid clips."
+        );
+      }
+
+      /* ---------------------------------------------
+         RENDER
+      --------------------------------------------- */
+
+      const host =
+        process.env.PUBLIC_BASE_URL ||
+        `${req.protocol}://${req.get("host")}`;
+
+      const clips = [];
+
+      for (
+        let i = 0;
+        i < analysis.clips.length;
+        i++
+      ) {
+        const item =
+          analysis.clips[i];
+
+        let start =
+          safeNumber(
+            item.start,
+            0
+          );
+
+        let end =
+          safeNumber(
+            item.end,
+            start + 15
+          );
+
+        start =
+          Math.max(
+            0,
+            start
+          );
+
+        end =
+          Math.max(
+            start + 1,
+            end
+          );
+
+        const duration =
+          end - start;
+
+        const clipId =
+          `clip_${timestamp}_${i + 1}`;
+
+        const clipPath =
+          path.join(
+            MEDIA_DIR,
+            `${clipId}.mp4`
+          );
+
+        console.log(
+          `[${requestId}] Rendering ${clipId}`
+        );
+
+        await execFileAsync(
+          "ffmpeg",
+          [
+            "-y",
+
+            "-ss",
+            String(start),
+
+            "-i",
+            rawVideoPath,
+
+            "-t",
+            String(duration),
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-c:a",
+            "aac",
+
+            "-movflags",
+            "+faststart",
+
+            clipPath
+          ],
+          {
+            maxBuffer:
+              30 * 1024 * 1024
+          }
+        );
+
+        if (
+          !fs.existsSync(
+            clipPath
+          )
+        ) {
+          continue;
+        }
+
+        clips.push({
+          id:
+            item.id ||
+            `clip-${i + 1}`,
+
+          start,
+          end,
+
+          title:
+            item.title || "",
+
+          hook:
+            item.hook || "",
+
+          caption:
+            item.caption || "",
+
+          scores:
+            item.scores || {},
+
+          previewUrl:
+            `${host}/media/${clipId}.mp4`,
+
+          rawUrl:
+            `${host}/media/raw_${timestamp}.mp4`
+        });
+      }
+
+      if (clips.length === 0) {
+        throw new Error(
+          "FFmpeg did not create any clips."
+        );
+      }
+
+      console.log(
+        `[${requestId}] SUCCESS - ${clips.length} clips`
+      );
+
+      return res.status(200).json({
+        success: true,
+        requestId,
+        clips
+      });
+
+    } catch (error) {
+      console.error(
+        `[${requestId}] ERROR:`,
+        error
+      );
+
+      removeFile(
+        rawVideoPath
+      );
+
+      return res.status(500).json({
+        success: false,
+        requestId,
+        error:
+          error?.message ||
+          "Video processing failed."
       });
     }
-
-    if (clips.length === 0) {
-      throw new Error(
-        "FFmpeg did not generate any clips."
-      );
-    }
-
-    console.log(
-      `[${requestId}] SUCCESS: ${clips.length} clips`
-    );
-
-    return res.status(200).json({
-      success: true,
-      requestId,
-      clips
-    });
-
-  } catch (error) {
-    console.error(
-      `[${requestId}] ANALYZE ERROR`
-    );
-
-    console.error(error);
-
-    removeFile(
-      rawVideoPath
-    );
-
-    return res.status(500).json({
-      success: false,
-      requestId,
-      error:
-        error?.message ||
-        "Video analysis failed.",
-      stage: detectStage(error)
-    });
   }
-});
-
-/* =====================================================
-   ERROR STAGE
-===================================================== */
-
-function detectStage(error) {
-  const message =
-    String(
-      error?.message || ""
-    ).toLowerCase();
-
-  if (
-    message.includes("yt-dlp") ||
-    message.includes("download")
-  ) {
-    return "video_download";
-  }
-
-  if (
-    message.includes("gemini") ||
-    message.includes("api") ||
-    message.includes("file")
-  ) {
-    return "gemini";
-  }
-
-  if (
-    message.includes("ffmpeg") ||
-    message.includes("clip")
-  ) {
-    return "ffmpeg";
-  }
-
-  if (
-    message.includes("json")
-  ) {
-    return "gemini_response";
-  }
-
-  return "unknown";
-}
+);
 
 /* =====================================================
    404
 ===================================================== */
 
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: "Route not found.",
-    path: req.path
-  });
-});
-
-/* =====================================================
-   GLOBAL ERROR
-===================================================== */
-
 app.use(
-  (error, req, res, next) => {
-    console.error(
-      "Unhandled server error:",
-      error
-    );
-
-    res.status(500).json({
+  (req, res) => {
+    res.status(404).json({
       success: false,
-      error:
-        "Internal server error."
+      error: "Route not found.",
+      path: req.path
     });
   }
 );
 
 /* =====================================================
-   START
+   SERVER
 ===================================================== */
 
 app.listen(
@@ -655,11 +834,11 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      "======================================"
+      "================================"
     );
 
     console.log(
-      "VIDEO WORKER STARTED"
+      "VIDEO WORKER ONLINE"
     );
 
     console.log(
@@ -671,11 +850,7 @@ app.listen(
     );
 
     console.log(
-      `NODE_ENV: ${process.env.NODE_ENV || "development"}`
-    );
-
-    console.log(
-      "======================================"
+      "================================"
     );
   }
 );
