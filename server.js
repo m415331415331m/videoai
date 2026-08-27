@@ -13,6 +13,7 @@ app.use(cors());
 app.use(express.json());
 app.use('/media', express.static('media'));
 
+// Health check endpoint
 app.get('/', (req, res) => {
   res.json({ success: true, service: "video-worker", status: "online" });
 });
@@ -38,12 +39,21 @@ app.post('/analyze', async (req, res) => {
 
   const timestamp = Date.now();
   const rawVideoPath = path.join(workDir, `raw_${timestamp}.mp4`);
+  const audioPath = path.join(workDir, `audio_${timestamp}.mp3`);
 
   try {
+    // 1. تنزيل الفيديو وجودة منخفضة لتوفير الذاكرة
     await execPromise(`yt-dlp -f "best[height<=720]" -o "${rawVideoPath}" "${targetUrl}"`);
 
-    const prompt = `أنت خبير في مقاطع الفيديو القصيرة (Shorts/Reels). قم بتحليل هذا الفيديو واستخرج أفضل المقاطع المفتاحية.
-أرجع الناتج بتنسيق JSON فقط على الشكل التالي دون أي نصوص إضافية:
+    // 2. استخراج الصوت بصيغة MP3 للتحليل
+    await execPromise(`ffmpeg -i "${rawVideoPath}" -vn -acodec libmp3lame -q:a 4 "${audioPath}"`);
+
+    // 3. قراءة ملف الصوت وتحويله لـ Base64 لإرساله لـ Gemini
+    const audioBuffer = fs.readFileSync(audioPath);
+    const audioBase64 = audioBuffer.toString("base64");
+
+    const prompt = `أنت خبير في مقاطع الفيديو القصيرة (Shorts/Reels). قم بتحليل هذا المقطع الصوتي المرفق واستخرج أفضل المقاطع المفتاحية ذات الجاذبية العالية.
+أرجع الناتج بتنسيق JSON فقط دون أي نصوص إضافية أو علامات markdown خارج الكود:
 {
   "clips": [
     {
@@ -58,13 +68,24 @@ app.post('/analyze', async (req, res) => {
   ]
 }`;
 
-    const result = await model.generateContent(prompt);
+    // إرسال الصوت المباشر مع الـ Prompt لـ Gemini
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          mimeType: "audio/mp3",
+          data: audioBase64
+        }
+      }
+    ]);
+
     const responseText = result.response.text();
     const cleanJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
     const analysisResult = JSON.parse(cleanJson);
 
     const host = `${req.protocol}://${req.get('host')}`;
 
+    // 4. قص المقاطع ومعالجتها بناءً على التحليل
     const processedClips = [];
     for (let i = 0; i < analysisResult.clips.length; i++) {
       const clip = analysisResult.clips[i];
@@ -87,6 +108,9 @@ app.post('/analyze', async (req, res) => {
       });
     }
 
+    // تنظيف الملف الصوتي المؤقت
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+
     return res.json({ clips: processedClips });
 
   } catch (error) {
@@ -99,4 +123,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
-  
