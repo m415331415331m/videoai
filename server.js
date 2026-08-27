@@ -11,11 +11,13 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+// إتاحة الملفات الناتجة للاستعراض والتنزيل
 app.use('/media', express.static('media'));
 
-// تهيئة Gemini API
+// تهيئة Gemini API باستخدام المفتاح من متغيرات البيئة
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
+// فحص صحة الخادم (Health Check Endpoint)
 app.get('/', (req, res) => {
   res.json({ success: true, service: "video-worker", status: "online" });
 });
@@ -36,20 +38,20 @@ app.post('/analyze', async (req, res) => {
   const audioPath = path.join(workDir, `audio_${timestamp}.mp3`);
 
   try {
-    // 1. تنزيل الفيديو
+    // 1. تنزيل الفيديو باستخدام yt-dlp
     await execPromise(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${rawVideoPath}" "${targetUrl}"`);
 
-    // 2. استخراج الصوت
+    // 2. استخراج الصوت باستخدام FFmpeg
     await execPromise(`ffmpeg -i "${rawVideoPath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}"`);
 
-    // 3. رفع الصوت إلى Gemini وتحليله
+    // 3. رفع الصوت وإرساله لـ Gemini للتحليل واستخراج المقاطع
     const audioFile = await ai.files.upload({
       file: audioPath,
       mimeType: 'audio/mp3',
     });
 
-    const prompt = `أنت خبير في مقاطع الفيديو القصيرة (Shorts/Reels). قم بتحليل هذا المقطع الصوتي واستخرج أفضل المقاطع المفتاحية. 
-أرجع الناتج بتنسيق JSON فقط بالشكل التالي دون نصوص إضافية:
+    const prompt = `أنت خبير في مقاطع الفيديو القصيرة (Shorts/Reels). قم بتحليل هذا المقطع الصوتي واستخرج أفضل المقاطع المفتاحية ذات الجاذبية العالية. 
+أرجع الناتج بتنسيق JSON فقط على الشكل التالي دون أي نصوص إضافية:
 {
   "clips": [
     {
@@ -73,7 +75,7 @@ app.post('/analyze', async (req, res) => {
     const analysisResult = JSON.parse(response.text);
     const host = `${req.protocol}://${req.get('host')}`;
 
-    // 4. قص المقاطع عبر FFmpeg
+    // 4. قص المقاطع ومعالجتها عبر FFmpeg
     const processedClips = [];
     for (let i = 0; i < analysisResult.clips.length; i++) {
       const clip = analysisResult.clips[i];
@@ -81,6 +83,7 @@ app.post('/analyze', async (req, res) => {
       const clipPath = path.join(workDir, `${clipId}.mp4`);
       const duration = clip.end - clip.start;
 
+      // قص المقطع
       await execPromise(`ffmpeg -ss ${clip.start} -i "${rawVideoPath}" -t ${duration} -c:v libx264 -c:a aac "${clipPath}"`);
 
       processedClips.push({
@@ -104,6 +107,8 @@ app.post('/analyze', async (req, res) => {
   }
 });
 
+// الاستماع على المضيف 0.0.0.0 لمنع خطأ 502 في Railway
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Worker running on port ${PORT}`));
-      
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Video Processing Worker running on port ${PORT}`);
+});
