@@ -10,26 +10,32 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const execFilePromise = promisify(execFile);
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 8080;
+
 const MEDIA_DIR = path.join(__dirname, "media");
 
-fs.mkdirSync(MEDIA_DIR, { recursive: true });
+fs.mkdirSync(MEDIA_DIR, {
+  recursive: true
+});
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+
+app.use(
+  express.json({
+    limit: "2mb"
+  })
+);
 
 app.use(
   "/media",
-  express.static(MEDIA_DIR, {
-    maxAge: "1h"
-  })
+  express.static(MEDIA_DIR)
 );
 
 /* =========================
@@ -41,6 +47,7 @@ app.get("/", (req, res) => {
     success: true,
     service: "video-worker",
     status: "online",
+    port: PORT,
     message: "Video Worker is running",
     endpoints: {
       health: "/health",
@@ -50,7 +57,7 @@ app.get("/", (req, res) => {
 });
 
 /* =========================
-   HEALTH CHECK
+   HEALTH
 ========================= */
 
 app.get("/health", (req, res) => {
@@ -63,57 +70,63 @@ app.get("/health", (req, res) => {
 });
 
 /* =========================
-   HELPERS
+   URL VALIDATION
 ========================= */
 
 function isValidUrl(value) {
   try {
-    const parsed = new URL(value);
+    const url = new URL(value);
 
     return (
-      parsed.protocol === "http:" ||
-      parsed.protocol === "https:"
+      url.protocol === "http:" ||
+      url.protocol === "https:"
     );
   } catch {
     return false;
   }
 }
 
-function extractJson(text) {
+/* =========================
+   JSON PARSER
+========================= */
+
+function parseGeminiJson(text) {
   let cleaned = String(text || "")
     .replace(/```json/gi, "")
     .replace(/```/g, "")
     .trim();
 
-  const firstBrace = cleaned.indexOf("{");
-  const lastBrace = cleaned.lastIndexOf("}");
+  const first = cleaned.indexOf("{");
+  const last = cleaned.lastIndexOf("}");
 
-  if (firstBrace === -1 || lastBrace === -1) {
-    throw new Error("Gemini did not return valid JSON.");
+  if (first === -1 || last === -1) {
+    throw new Error(
+      "Gemini returned an invalid JSON response."
+    );
   }
 
-  cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+  cleaned = cleaned.substring(
+    first,
+    last + 1
+  );
 
   return JSON.parse(cleaned);
 }
 
-function sanitizeNumber(value, fallback = 0) {
-  const number = Number(value);
+/* =========================
+   CLEANUP
+========================= */
 
-  if (!Number.isFinite(number)) {
-    return fallback;
-  }
-
-  return number;
-}
-
-function cleanupFile(filePath) {
+function removeFile(file) {
   try {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
     }
   } catch (error) {
-    console.error("Cleanup error:", error.message);
+    console.error(
+      "Could not remove file:",
+      error.message
+    );
   }
 }
 
@@ -122,9 +135,16 @@ function cleanupFile(filePath) {
 ========================= */
 
 app.post("/analyze", async (req, res) => {
-  const { url, videoUrl, youtubeUrl } = req.body || {};
+  const {
+    url,
+    videoUrl,
+    youtubeUrl
+  } = req.body || {};
 
-  const targetUrl = url || videoUrl || youtubeUrl;
+  const targetUrl =
+    url ||
+    videoUrl ||
+    youtubeUrl;
 
   if (!targetUrl) {
     return res.status(400).json({
@@ -140,33 +160,44 @@ app.post("/analyze", async (req, res) => {
     });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey =
+    process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
     return res.status(500).json({
       success: false,
-      error: "GEMINI_API_KEY is not configured."
+      error:
+        "GEMINI_API_KEY is not configured in Railway Variables."
     });
   }
 
   const timestamp = Date.now();
 
-  const rawVideoPath = path.join(
-    MEDIA_DIR,
-    `raw_${timestamp}.mp4`
-  );
+  const rawVideoPath =
+    path.join(
+      MEDIA_DIR,
+      `raw_${timestamp}.mp4`
+    );
 
   try {
-    console.log("Downloading video:", targetUrl);
+    console.log(
+      "Starting video download..."
+    );
+
+    console.log(
+      "URL:",
+      targetUrl
+    );
 
     /* =========================
-       DOWNLOAD
+       YT-DLP
     ========================= */
 
-    await execFilePromise(
+    await execFileAsync(
       "yt-dlp",
       [
         "--no-playlist",
+        "--restrict-filenames",
         "-f",
         "best[height<=720]/best",
         "--merge-output-format",
@@ -176,50 +207,58 @@ app.post("/analyze", async (req, res) => {
         targetUrl
       ],
       {
-        maxBuffer: 10 * 1024 * 1024
+        maxBuffer:
+          20 * 1024 * 1024
       }
     );
 
     if (!fs.existsSync(rawVideoPath)) {
-      throw new Error("Video download failed.");
+      throw new Error(
+        "yt-dlp finished but no video file was created."
+      );
     }
 
-    const stats = fs.statSync(rawVideoPath);
+    const fileStats =
+      fs.statSync(rawVideoPath);
 
-    if (stats.size === 0) {
-      throw new Error("Downloaded video is empty.");
+    if (fileStats.size <= 0) {
+      throw new Error(
+        "Downloaded video is empty."
+      );
     }
 
-    console.log("Video downloaded:", stats.size, "bytes");
+    console.log(
+      "Video downloaded successfully:",
+      fileStats.size,
+      "bytes"
+    );
 
     /* =========================
        GEMINI
     ========================= */
 
-    const genAI = new GoogleGenerativeAI(apiKey);
+    const genAI =
+      new GoogleGenerativeAI(
+        apiKey
+      );
 
-    const model = genAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL || "gemini-1.5-flash"
-    });
-
-    /*
-     * ملاحظة مهمة:
-     * النسخة الأصلية من الكود كانت ترسل النص فقط إلى Gemini.
-     * لذلك Gemini لم يكن يستلم ملف الفيديو فعلياً.
-     *
-     * هذا الجزء يحتاج File API / نموذج يدعم إدخال الفيديو
-     * إذا كان المطلوب تحليل محتوى الفيديو نفسه.
-     */
+    const model =
+      genAI.getGenerativeModel({
+        model:
+          process.env.GEMINI_MODEL ||
+          "gemini-1.5-flash"
+      });
 
     const prompt = `
 You are an expert short-form video editor.
 
-Analyze the provided video and identify the strongest moments
-for Shorts, Reels, and TikTok.
+Analyze the video and identify the strongest moments
+that could work as YouTube Shorts, Instagram Reels,
+or TikTok clips.
 
 Return ONLY valid JSON.
 
-Required format:
+Use exactly this structure:
 
 {
   "clips": [
@@ -240,66 +279,106 @@ Required format:
 }
 
 Rules:
-- start and end must be numbers.
+
+- start must be a number.
+- end must be a number.
 - end must be greater than start.
-- Never return markdown.
+- Do not return markdown.
+- Do not return explanations.
 - Return JSON only.
 `;
 
     /*
-     * حالياً نرسل prompt فقط.
-     * يجب إضافة رفع الفيديو إلى Gemini هنا إذا كان
-     * تحليل المحتوى المرئي مطلوباً فعلياً.
+     * ملاحظة:
+     * هذا الطلب يرسل Prompt إلى Gemini.
+     * لكي يقوم Gemini بتحليل الصورة والصوت داخل الفيديو
+     * نفسه، يجب استخدام آلية رفع ملفات الفيديو المناسبة
+     * لنموذج Gemini/API المستخدم فعلياً.
      */
 
-    const result = await model.generateContent(prompt);
+    const result =
+      await model.generateContent(
+        prompt
+      );
 
-    const responseText = result.response.text();
+    const responseText =
+      result.response.text();
 
-    const analysisResult = extractJson(responseText);
+    const analysis =
+      parseGeminiJson(
+        responseText
+      );
 
     if (
-      !analysisResult ||
-      !Array.isArray(analysisResult.clips)
+      !analysis ||
+      !Array.isArray(
+        analysis.clips
+      )
     ) {
       throw new Error(
-        "Gemini response does not contain a valid clips array."
+        "Gemini response does not contain a clips array."
       );
     }
 
     /* =========================
-       CREATE CLIPS
+       GENERATE CLIPS
     ========================= */
 
     const host =
       process.env.PUBLIC_BASE_URL ||
       `${req.protocol}://${req.get("host")}`;
 
-    const processedClips = [];
+    const clips = [];
 
-    for (let i = 0; i < analysisResult.clips.length; i++) {
-      const clip = analysisResult.clips[i];
+    for (
+      let i = 0;
+      i < analysis.clips.length;
+      i++
+    ) {
+      const item =
+        analysis.clips[i];
 
-      const start = Math.max(
+      let start =
+        Number(item.start);
+
+      let end =
+        Number(item.end);
+
+      if (!Number.isFinite(start)) {
+        start = 0;
+      }
+
+      if (!Number.isFinite(end)) {
+        end = start + 10;
+      }
+
+      start = Math.max(
         0,
-        sanitizeNumber(clip.start)
+        start
       );
 
-      const end = Math.max(
+      end = Math.max(
         start + 0.1,
-        sanitizeNumber(clip.end, start + 10)
+        end
       );
 
-      const duration = end - start;
+      const duration =
+        end - start;
 
-      const clipId = `clip_${timestamp}_${i + 1}`;
+      const clipId =
+        `clip_${timestamp}_${i + 1}`;
 
-      const clipPath = path.join(
-        MEDIA_DIR,
-        `${clipId}.mp4`
+      const clipPath =
+        path.join(
+          MEDIA_DIR,
+          `${clipId}.mp4`
+        );
+
+      console.log(
+        `Creating clip ${i + 1}: ${start}-${end}`
       );
 
-      await execFilePromise(
+      await execFileAsync(
         "ffmpeg",
         [
           "-y",
@@ -320,47 +399,78 @@ Rules:
           clipPath
         ],
         {
-          maxBuffer: 10 * 1024 * 1024
+          maxBuffer:
+            20 * 1024 * 1024
         }
       );
 
-      if (!fs.existsSync(clipPath)) {
+      if (
+        !fs.existsSync(
+          clipPath
+        )
+      ) {
         continue;
       }
 
-      processedClips.push({
-        id: clip.id || `clip-${i + 1}`,
+      clips.push({
+        id:
+          item.id ||
+          `clip-${i + 1}`,
+
         start,
         end,
-        title: clip.title || "",
-        hook: clip.hook || "",
-        caption: clip.caption || "",
-        scores: clip.scores || {},
+
+        title:
+          item.title || "",
+
+        hook:
+          item.hook || "",
+
+        caption:
+          item.caption || "",
+
+        scores:
+          item.scores || {},
+
         previewUrl:
           `${host}/media/${clipId}.mp4`,
+
         rawUrl:
           `${host}/media/raw_${timestamp}.mp4`
       });
     }
 
-    if (processedClips.length === 0) {
+    if (clips.length === 0) {
       throw new Error(
-        "No video clips could be generated."
+        "No clips were generated."
       );
     }
 
     return res.status(200).json({
       success: true,
-      clips: processedClips
+      clips
     });
 
   } catch (error) {
     console.error(
-      "Worker Error:",
+      "===================="
+    );
+
+    console.error(
+      "VIDEO WORKER ERROR"
+    );
+
+    console.error(
       error
     );
 
-    cleanupFile(rawVideoPath);
+    console.error(
+      "===================="
+    );
+
+    removeFile(
+      rawVideoPath
+    );
 
     return res.status(500).json({
       success: false,
@@ -372,23 +482,38 @@ Rules:
 });
 
 /* =========================
-   GLOBAL ERROR HANDLER
+   404
 ========================= */
 
-app.use((error, req, res, next) => {
-  console.error(
-    "Unhandled Error:",
-    error
-  );
-
-  res.status(500).json({
+app.use((req, res) => {
+  res.status(404).json({
     success: false,
-    error: "Internal server error."
+    error: "Route not found.",
+    path: req.path
   });
 });
 
 /* =========================
-   SERVER
+   GLOBAL ERROR
+========================= */
+
+app.use(
+  (error, req, res, next) => {
+    console.error(
+      "Unhandled server error:",
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      error:
+        "Internal server error."
+    });
+  }
+);
+
+/* =========================
+   START SERVER
 ========================= */
 
 app.listen(
@@ -396,7 +521,23 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `Video Worker running on port ${PORT}`
+      "================================"
+    );
+
+    console.log(
+      "VIDEO WORKER STARTED"
+    );
+
+    console.log(
+      `PORT: ${PORT}`
+    );
+
+    console.log(
+      "HOST: 0.0.0.0"
+    );
+
+    console.log(
+      "================================"
     );
   }
 );
